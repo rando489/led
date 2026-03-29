@@ -1,15 +1,14 @@
 # =========================
-# setup.sh (FULLY SELF-CONTAINED - Pi 5 LGPIO)
+# setup.sh (TRUE LGPIO BITBANG - PI 5 CORRECT)
 # =========================
 #!/bin/bash
 
 set -e
 
-echo "=== WS2812B E1.31 Setup for Raspberry Pi 5 (LGPIO) ==="
+echo "=== WS2812B E1.31 Setup for Raspberry Pi 5 (REAL LGPIO) ==="
 
-# Prevent running as root
 if [ "$EUID" -eq 0 ]; then
-  echo "Run this script as a normal user, not root."
+  echo "Run as normal user, not root"
   exit
 fi
 
@@ -17,21 +16,20 @@ fi
 read -p "Enter GPIO pin (default 4): " PIN
 PIN=${PIN:-4}
 
-# Ask for LED count
+# Ask LED count
 read -p "Enter number of LEDs: " LED_COUNT
 
-# Install dependencies
+# Install deps
 echo "Installing dependencies..."
 sudo apt update
 sudo apt install -y python3-pip python3-lgpio
-pip3 install --break-system-packages rpi_ws281x sacn
+pip3 install --break-system-packages sacn
 
-# Paths
 SCRIPT_PATH="$(pwd)/e131_ws2812b.py"
 CONFIG_FILE="$(pwd)/e131_ws2812b_config.json"
 
 # =========================
-# CREATE PYTHON SCRIPT
+# CREATE PYTHON SCRIPT (REAL LGPIO DRIVER)
 # =========================
 cat <<'PYEOF' > $SCRIPT_PATH
 #!/usr/bin/env python3
@@ -40,7 +38,13 @@ import argparse
 import json
 import time
 import sacn
-from rpi_ws281x import PixelStrip, Color
+import lgpio
+
+# WS2812 timing (approx ns converted to seconds)
+T0H = 0.00000035
+T0L = 0.00000080
+T1H = 0.00000070
+T1L = 0.00000060
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--pin", type=int)
@@ -59,24 +63,54 @@ else:
     pin = args.pin
     led_count = args.count
 
-strip = PixelStrip(led_count, pin, strip_type=0x00100800)
-strip.begin()
+h = lgpio.gpiochip_open(0)
+lgpio.gpio_claim_output(h, pin)
 
+pixels = [(0,0,0)] * led_count
+
+# =========================
+# LOW LEVEL WRITE
+# =========================
+def send_bit(bit):
+    if bit:
+        lgpio.gpio_write(h, pin, 1)
+        time.sleep(T1H)
+        lgpio.gpio_write(h, pin, 0)
+        time.sleep(T1L)
+    else:
+        lgpio.gpio_write(h, pin, 1)
+        time.sleep(T0H)
+        lgpio.gpio_write(h, pin, 0)
+        time.sleep(T0L)
+
+
+def send_byte(byte):
+    for i in range(8):
+        send_bit((byte << i) & 0x80)
+
+
+def show():
+    for r,g,b in pixels:
+        send_byte(g)
+        send_byte(r)
+        send_byte(b)
+    time.sleep(0.00005)
+
+# =========================
 # TEST MODE
+# =========================
 if args.test:
-    print(f"Lighting first {args.test} LEDs...")
-    for i in range(args.test):
-        strip.setPixelColor(i, Color(255, 255, 255))
-    strip.show()
-
+    for i in range(min(args.test, led_count)):
+        pixels[i] = (255,255,255)
+    show()
     input("Press Enter to clear...")
-
-    for i in range(led_count):
-        strip.setPixelColor(i, Color(0, 0, 0))
-    strip.show()
+    pixels[:] = [(0,0,0)] * led_count
+    show()
     exit()
 
-# E1.31
+# =========================
+# E1.31 RECEIVER
+# =========================
 receiver = sacn.sACNreceiver()
 receiver.start()
 
@@ -90,24 +124,23 @@ def callback(packet):
         r = data[i*3]
         g = data[i*3+1]
         b = data[i*3+2]
-        strip.setPixelColor(i, Color(r, g, b))
+        pixels[i] = (r,g,b)
 
-    strip.show()
+    show()
 
-print("E1.31 listener running...")
+print("E1.31 LGPIO controller running...")
 
 try:
     while True:
         time.sleep(1)
 except KeyboardInterrupt:
     receiver.stop()
+    lgpio.gpiochip_close(h)
 PYEOF
 
 chmod +x $SCRIPT_PATH
 
-# =========================
-# SAVE CONFIG
-# =========================
+# Save config
 cat <<EOF > $CONFIG_FILE
 {
     "pin": $PIN,
@@ -115,26 +148,16 @@ cat <<EOF > $CONFIG_FILE
 }
 EOF
 
-echo "Config saved to $CONFIG_FILE"
-
-# =========================
-# TEST MODE
-# =========================
-echo "\n=== TEST MODE ==="
-read -p "Enter number of LEDs to light up for testing: " TEST_COUNT
-
+# Test mode
+read -p "Test LED count: " TEST_COUNT
 python3 $SCRIPT_PATH --pin $PIN --count $LED_COUNT --test $TEST_COUNT
 
-# =========================
-# SYSTEMD SERVICE
-# =========================
+# Systemd
 SERVICE_FILE="/etc/systemd/system/e131_ws2812b.service"
-
-echo "Creating systemd service..."
 
 sudo bash -c "cat > $SERVICE_FILE" <<EOF
 [Unit]
-Description=E1.31 WS2812B Controller (Pi 5 LGPIO)
+Description=E1.31 WS2812B (LGPIO TRUE)
 After=network.target
 
 [Service]
@@ -146,9 +169,7 @@ User=$USER
 WantedBy=multi-user.target
 EOF
 
-sudo systemctl daemon-reexec
 sudo systemctl daemon-reload
 sudo systemctl enable e131_ws2812b.service
 
-echo "\nSetup complete!"
-echo "Start with: sudo systemctl start e131_ws2812b"
+echo "Done. Start with: sudo systemctl start e131_ws2812b"
